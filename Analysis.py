@@ -3,17 +3,20 @@ IAMST 2027 benchmark: Gamma GLM vs tree ensembles for medical-charge prediction,
 exact Shapley explanations, explanation stability and subgroup error audit.
 
 Data: insurance.csv (Medical Cost Personal dataset, n = 1,338).
-Requirements: numpy, pandas, scikit-learn, matplotlib. XGBoost is used automatically if installed.
+Requirements: numpy, pandas, scikit-learn, matplotlib.
+Usage: python analysis.py insurance.csv            (scikit-learn gradient boosting; reproduces the paper)
+       python analysis.py insurance.csv --xgboost  (optional XGBoost variant; results will differ)
+Exact duplicate records are kept in the same fold in every cross-validation split.
 Prespecified selection criterion: lowest mean repeated 5-fold CV RMSE on the 80% training portion
 (RMSE targets the conditional mean, which is the estimand).
 """
-import json, itertools, math, os, sys, warnings
-import numpy as np, pandas as pd
+import json, itertools, math, os, sys, warnings, hashlib
+import numpy as np, pandas as pd, sklearn
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.base import BaseEstimator, RegressorMixin, clone
-from sklearn.model_selection import (train_test_split, GridSearchCV, RepeatedKFold, KFold, cross_validate)
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_validate
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler, FunctionTransformer
 from sklearn.pipeline import Pipeline
@@ -25,17 +28,41 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 warnings.filterwarnings("ignore")
 SEED = 42
 OUT = "out"; os.makedirs(OUT, exist_ok=True)
-DATA = sys.argv[1] if len(sys.argv) > 1 else "ds/insurance.csv"
-try:
-    from xgboost import XGBRegressor; HAS_XGB = True
-except ImportError:
-    HAS_XGB = False
+ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+DATA = ARGS[0] if ARGS else "ds/insurance.csv"
+USE_XGB = "--xgboost" in sys.argv
+if USE_XGB:
+    from xgboost import XGBRegressor
+CONFIG_VERSION = "v2-grouped"
+
+raw_bytes = open(DATA, "rb").read()
+norm_bytes = raw_bytes.replace(b"\r\n", b"\n").rstrip(b"\n")   # line-ending-independent content hash
+HASH_CONTENT = hashlib.sha256(norm_bytes).hexdigest()
+HASH_RAW = hashlib.sha256(raw_bytes).hexdigest()
+print("content SHA-256 (line-ending independent):", HASH_CONTENT)
 
 df = pd.read_csv(DATA)
 FEATS = ["age", "sex", "bmi", "children", "smoker", "region"]
 CAT, NUM = ["sex", "smoker", "region"], ["age", "bmi", "children"]
 X, y = df[FEATS], df["charges"].to_numpy()
-Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=SEED, stratify=df["smoker"])
+# Exact duplicates share a group id so they are never split across training and validation folds.
+GROUPS = df.groupby(FEATS + ["charges"], sort=False).ngroup().to_numpy()
+idx_tr, idx_te = train_test_split(np.arange(len(df)), test_size=0.2, random_state=SEED, stratify=df["smoker"])
+assert not set(GROUPS[idx_tr]) & set(GROUPS[idx_te]), "duplicate records split across train/test"
+Xtr, Xte, ytr, yte = X.iloc[idx_tr], X.iloc[idx_te], y[idx_tr], y[idx_te]
+gtr = GROUPS[idx_tr]
+
+def group_splits(groups, n_splits=5, n_repeats=1, seed=SEED):
+    """Repeated, shuffled K-fold that keeps each group (duplicate set) within one fold.
+    Identical to scikit-learn's GroupKFold(shuffle=True, random_state=...) (>= 1.6),
+    implemented here so the script gives the same folds on any scikit-learn version."""
+    groups = np.asarray(groups); out = []
+    for r in range(n_repeats):
+        ug = np.random.RandomState(seed + r).permutation(np.unique(groups))
+        for test_ids in np.array_split(ug, n_splits):
+            test_mask = np.isin(groups, test_ids)
+            out.append((np.where(~test_mask)[0], np.where(test_mask)[0]))
+    return out
 
 def prep(scale=True):
     return ColumnTransformer([("cat", OneHotEncoder(drop="first"), CAT),
@@ -70,7 +97,7 @@ tuned = {
     "Random forest": (Pipeline([("p", prep(False)), ("m", RandomForestRegressor(n_estimators=300, random_state=SEED, n_jobs=1))]),
         {"m__max_depth": [4, 6, 8, None], "m__min_samples_leaf": [1, 5, 10], "m__max_features": [0.5, 1.0]}),
 }
-if HAS_XGB:
+if USE_XGB:
     tuned["XGBoost"] = (Pipeline([("p", prep(False)), ("m", XGBRegressor(random_state=SEED, n_jobs=1, subsample=0.8))]),
         {"m__n_estimators": [100, 200, 400], "m__learning_rate": [0.03, 0.1], "m__max_depth": [2, 3, 4],
          "m__min_child_weight": [5, 10], "m__reg_lambda": [1, 10]})
@@ -82,7 +109,9 @@ else:
     BOOST = "Gradient boosting"
 
 def rmse(a, b): return float(np.sqrt(mean_squared_error(a, b)))
-R = {"n": len(df), "ntr": len(Xtr), "nte": len(Xte), "boost_name": BOOST, "has_xgb": HAS_XGB}
+R = {"n": len(df), "ntr": len(Xtr), "nte": len(Xte), "boost_name": BOOST, "uses_xgboost": USE_XGB,
+     "hash_content_sha256": HASH_CONTENT, "hash_raw_sha256": HASH_RAW, "config": CONFIG_VERSION, "versions": {"python": sys.version.split()[0], "numpy": np.__version__, "pandas": pd.__version__, "scikit-learn": sklearn.__version__},
+     "duplicate_groups": int((pd.Series(GROUPS).value_counts() > 1).sum())}
 
 # ---------- 1. Descriptives ----------
 R["desc"] = dict(min=float(y.min()), median=float(np.median(y)), mean=float(y.mean()), max=float(y.max()),
@@ -97,7 +126,7 @@ R["desc"] = dict(min=float(y.min()), median=float(np.median(y)), mean=float(y.me
 # ---------- 2. Tuning on training portion only ----------
 models, R["best_params"], R["grid_size"] = dict(fixed), {}, {}
 for name, (pipe, grid) in tuned.items():
-    gs = GridSearchCV(pipe, grid, cv=KFold(5, shuffle=True, random_state=SEED),
+    gs = GridSearchCV(pipe, grid, cv=group_splits(gtr),
                       scoring="neg_root_mean_squared_error", n_jobs=-1).fit(Xtr, ytr)
     models[name] = gs.best_estimator_
     R["best_params"][name] = {k[3:]: v for k, v in gs.best_params_.items()}
@@ -105,7 +134,7 @@ for name, (pipe, grid) in tuned.items():
     print("tuned", name, R["best_params"][name], flush=True)
 
 # ---------- 3. Repeated CV within training portion (selection) + single test evaluation ----------
-rkf = RepeatedKFold(n_splits=5, n_repeats=5, random_state=SEED)
+rkf = group_splits(gtr, 5, 5, SEED)
 perf = []
 for name, m in models.items():
     cv = cross_validate(m, Xtr, ytr, cv=rkf, n_jobs=-1,
@@ -142,24 +171,28 @@ for comp in ["Gamma GLM", "Gamma GLM + actuarial terms", "OLS"]:
         rmse=float(rmse(yte, P[TREE_SEL]) - rmse(yte, P[comp])), rmse_ci=np.percentile(drmse, [2.5, 97.5]).tolist())
 print(R["boot_diff"])
 
-# ---------- 4. Nested repeated CV on full data (ranking stability) ----------
-outer = RepeatedKFold(n_splits=5, n_repeats=2, random_state=SEED + 1)
-nest = []
-CACHE = f"{OUT}/nested_cache_{BOOST.replace(' ', '_')}.csv"
-splits = [] if os.path.exists(CACHE) else list(outer.split(X))
-for k, (a, b) in enumerate(splits):
-    for name in list(fixed) + list(tuned):
-        if name in tuned:
-            pipe, grid = tuned[name]
-            m = GridSearchCV(clone(pipe), grid, cv=KFold(5, shuffle=True, random_state=k),
-                             scoring="neg_root_mean_squared_error", n_jobs=-1)
-        else:
-            m = clone(fixed[name])
-        m.fit(X.iloc[a], y[a]); p = m.predict(X.iloc[b])
-        nest.append(dict(fold=k, model=name, mae=mean_absolute_error(y[b], p), rmse=rmse(y[b], p), r2=r2_score(y[b], p)))
-    print("outer fold", k, flush=True)
-nest = pd.read_csv(CACHE) if os.path.exists(CACHE) else pd.DataFrame(nest)
-nest.to_csv(CACHE, index=False)
+# ---------- 4. Nested repeated CV on full data (ranking stability + nested subgroup predictions) ----------
+outer = group_splits(GROUPS, 5, 2, SEED + 1)
+ALL = list(fixed) + list(tuned)
+CACHE = f"{OUT}/nested_{HASH_CONTENT[:12]}_{BOOST.replace(' ', '_')}_{CONFIG_VERSION}_sk{sklearn.__version__}.npz"
+if os.path.exists(CACHE):
+    z = np.load(CACHE, allow_pickle=True); nest = pd.DataFrame(list(z["nest"])); NPRED = z["npred"].item()
+else:
+    nest, NPRED = [], {m: np.full((2, len(y)), np.nan) for m in ALL}
+    for k, (a, b) in enumerate(outer):
+        rep_ = k // 5
+        for name in ALL:
+            if name in tuned:
+                pipe, grid = tuned[name]
+                m = GridSearchCV(clone(pipe), grid, cv=group_splits(GROUPS[a], seed=SEED + 100 + k),
+                                 scoring="neg_root_mean_squared_error", n_jobs=-1)
+            else:
+                m = clone(fixed[name])
+            m.fit(X.iloc[a], y[a]); p = m.predict(X.iloc[b]); NPRED[name][rep_, b] = p
+            nest.append(dict(fold=k, model=name, mae=mean_absolute_error(y[b], p), rmse=rmse(y[b], p), r2=r2_score(y[b], p)))
+        print("outer fold", k, flush=True)
+    np.savez(CACHE, nest=np.array(nest, dtype=object), npred=np.array(NPRED, dtype=object))
+    nest = pd.DataFrame(nest)
 ns = nest.groupby("model").agg(mae=("mae", "mean"), mae_sd=("mae", "std"), rmse=("rmse", "mean"),
                                rmse_sd=("rmse", "std"), r2=("r2", "mean"), r2_sd=("r2", "std"))
 best_per_fold = nest[~nest.model.str.contains("sensitivity")].loc[
@@ -167,6 +200,11 @@ best_per_fold = nest[~nest.model.str.contains("sensitivity")].loc[
 print(ns.round(3)); print("best by fold:", best_per_fold)
 R["nested"] = ns.reset_index().to_dict("records"); R["nested_best"] = best_per_fold
 R["nested_folds"] = int(nest.fold.nunique())
+pv = nest.pivot(index="fold", columns="model", values="rmse")
+R["nested_paired_rmse_gb_minus_rf"] = dict(mean=float((pv[BOOST] - pv["Random forest"]).mean()),
+    sd=float((pv[BOOST] - pv["Random forest"]).std()), min=float((pv[BOOST] - pv["Random forest"]).min()),
+    max=float((pv[BOOST] - pv["Random forest"]).max()))
+nest.to_csv(f"{OUT}/nested_folds.csv", index=False)
 
 # ---------- 5. GLM relativities and Gamma variance check ----------
 def relativities(pipe_raw, Xa, ya, cols):
@@ -296,26 +334,33 @@ R["local"] = {k: dict(profile={f: (v if isinstance(v, str) else float(v)) for f,
                       add_err=float(base[i] + phi[i].sum() - pred_sel[i])) for k, i in cases.items()}
 for k, v in R["local"].items(): print(k, v)
 
-# ---------- 7. Subgroup error audit (out-of-fold, full data, fixed hyperparameters) ----------
-oof = {}
-kf = KFold(5, shuffle=True, random_state=SEED + 2)
+# ---------- 7. Subgroup error audit from NESTED outer-fold predictions ----------
+# Each record has two outer-fold predictions (2 repeats); per-record errors are averaged over the repeats.
+def boot_mean(v, B=2000):
+    bs = rng.integers(0, len(v), (B, len(v))); return v[bs].mean(1)
+sg, sgdiff = [], []
 for name in ["Gamma GLM", "Gamma GLM + actuarial terms", TREE_SEL]:
-    p = np.zeros(len(y))
-    for a, b in kf.split(X): p[b] = clone(models[name]).fit(X.iloc[a], y[a]).predict(X.iloc[b])
-    oof[name] = p
-sg = []
-for var in ["sex", "region", "smoker"]:
-    for lvl in sorted(df[var].unique()):
-        idx = np.where(df[var].values == lvl)[0]
-        for name, p in oof.items():
-            e = p[idx] - y[idx]
-            bs = rng.integers(0, len(idx), (2000, len(idx)))
-            mae_b = np.abs(e[bs]).mean(1); se_b = e[bs].mean(1)
-            sg.append(dict(var=var, level=lvl, model=name, n=len(idx), obs=float(y[idx].mean()), pred=float(p[idx].mean()),
-                           mae=float(np.abs(e).mean()), mae_ci=np.percentile(mae_b, [2.5, 97.5]).tolist(),
-                           mse=float(e.mean()), mse_ci=np.percentile(se_b, [2.5, 97.5]).tolist()))
-R["subgroup"] = sg
-print(pd.DataFrame(sg)[["var", "level", "model", "n", "mae", "mse"]].round(0).to_string())
+    E = NPRED[name] - y                      # signed errors, shape (2, n)
+    se, ae = E.mean(0), np.abs(E).mean(0)    # per-record mean signed / absolute error
+    for var in ["sex", "region", "smoker"]:
+        levels = sorted(df[var].unique())
+        for lvl in levels:
+            idx = np.where(df[var].values == lvl)[0]; rest = np.where(df[var].values != lvl)[0]
+            mb, sb = boot_mean(ae[idx]), boot_mean(se[idx])
+            sg.append(dict(var=var, level=lvl, model=name, n=len(idx), obs=float(y[idx].mean()),
+                           pred=float(NPRED[name][:, idx].mean()), mae=float(ae[idx].mean()),
+                           mae_ci=np.percentile(mb, [2.5, 97.5]).tolist(),
+                           mean_signed_error=float(se[idx].mean()), mean_signed_error_ci=np.percentile(sb, [2.5, 97.5]).tolist()))
+            if var == "sex" and lvl != "female": continue
+            if var == "smoker" and lvl != "yes": continue
+            d_mae = boot_mean(ae[idx]) - boot_mean(ae[rest]); d_se = boot_mean(se[idx]) - boot_mean(se[rest])
+            sgdiff.append(dict(var=var, level=lvl, vs=("male" if var == "sex" else "no" if var == "smoker" else "other regions"),
+                               model=name, mae_diff=float(ae[idx].mean() - ae[rest].mean()),
+                               mae_diff_ci=np.percentile(d_mae, [2.5, 97.5]).tolist(),
+                               se_diff=float(se[idx].mean() - se[rest].mean()), se_diff_ci=np.percentile(d_se, [2.5, 97.5]).tolist()))
+R["subgroup"] = sg; R["subgroup_diff"] = sgdiff
+print(pd.DataFrame(sg)[["var", "level", "model", "n", "mae", "mean_signed_error"]].round(0).to_string())
+print(pd.DataFrame(sgdiff).round(0).to_string())
 
 # ---------- 8. Figures ----------
 plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 8.5, "axes.spines.top": False,
@@ -338,16 +383,29 @@ ax[0, 2].legend(frameon=False, fontsize=7, loc="upper left")
 plt.tight_layout(); plt.savefig(f"{OUT}/fig1_fit.png"); plt.close()
 
 order = imp.feature.tolist()
-fig, ax = plt.subplots(figsize=(6.4, 2.9))
-codes = {"sex": lambda s: (s == "male").astype(float), "smoker": lambda s: (s == "yes").astype(float),
-         "region": lambda s: s.map({"northeast": 0, "northwest": 1/3, "southeast": 2/3, "southwest": 1}).astype(float)}
+fig, ax = plt.subplots(figsize=(6.6, 3.0))
 jit = np.random.default_rng(1)
+BIN = {"smoker": ("yes", "no"), "sex": ("male", "female")}
+REG = {"northeast": "#4c72b0", "northwest": "#55a868", "southeast": "#c44e52", "southwest": "#8172b2"}
+from matplotlib.lines import Line2D
 for r_, f in enumerate(order[::-1]):
-    v = Xr[f]; v = codes[f](v) if f in codes else (v - v.min()) / (v.max() - v.min())
-    sc = ax.scatter(phi[:, FEATS.index(f)], r_ + jit.uniform(-0.28, 0.28, len(v)), c=v, cmap="coolwarm", s=5, vmin=0, vmax=1)
+    yy = r_ + jit.uniform(-0.28, 0.28, len(Xr)); xx = phi[:, FEATS.index(f)]
+    if f in NUM:
+        v = Xr[f]; v = (v - v.min()) / (v.max() - v.min())
+        sc = ax.scatter(xx, yy, c=v, cmap="coolwarm", s=5, vmin=0, vmax=1)
+    elif f in BIN:
+        a1, a0 = BIN[f]; col = np.where(Xr[f].values == a1, "#d17a00", "#5a5a5a")
+        ax.scatter(xx, yy, c=col, s=5)
+    else:
+        ax.scatter(xx, yy, c=[REG[v] for v in Xr[f]], s=5)
 ax.set_yticks(range(n)); ax.set_yticklabels(order[::-1]); ax.axvline(0, color="k", lw=0.6)
 ax.xaxis.set_major_formatter(KF); ax.set_xlabel(f"Shapley value (USD; contribution to {TREE_SEL} prediction)")
-cb = plt.colorbar(sc, ax=ax, pad=0.01); cb.set_ticks([0, 1]); cb.set_ticklabels(["low / no / female", "high / yes / male"]); cb.ax.tick_params(labelsize=6.5)
+cb = plt.colorbar(sc, ax=ax, pad=0.01, fraction=0.04); cb.set_ticks([0, 1]); cb.set_ticklabels(["low", "high"])
+cb.set_label("age, BMI, children", fontsize=6.5); cb.ax.tick_params(labelsize=6.5)
+h = [Line2D([], [], marker="o", ls="", color="#d17a00", ms=4, label="smoker = yes / sex = male"),
+     Line2D([], [], marker="o", ls="", color="#5a5a5a", ms=4, label="smoker = no / sex = female")] + \
+    [Line2D([], [], marker="o", ls="", color=c, ms=4, label=k) for k, c in REG.items()]
+ax.legend(handles=h, frameon=False, fontsize=6, loc="lower right", ncol=2)
 plt.tight_layout(); plt.savefig(f"{OUT}/fig2_beeswarm.png"); plt.close()
 
 fig, ax = plt.subplots(1, 3, figsize=(7.2, 2.6), sharey=True)
